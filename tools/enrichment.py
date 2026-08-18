@@ -481,15 +481,13 @@ _VERDICT_LABEL = {
 # Default stays "full" so this is opt-in per environment and revertible without
 # a redeploy, matching the killswitch convention used by every other feature
 # here. Set COMMENT_VERBOSITY=compact in the Container App env to enable.
-_COMPACT_SNIPPET_CHARS = 140     # Confluence chunk / whitelist snippet cap
-_COMPACT_RATIONALE_CHARS = 120   # Sentinel per-query LLM rationale cap
-_COMPACT_SOCRADAR_FINDINGS = 2   # top_findings shown, malicious IOCs only
-
-
-def _compact_comments() -> bool:
-    """True when COMMENT_VERBOSITY=compact. Any other value (including unset)
-    preserves the pre-2026-08 full layout byte for byte."""
-    return os.environ.get("COMMENT_VERBOSITY", "full").strip().lower() == "compact"
+#
+# Verbosity resolution, the 6 truncation caps (compact + full), section order and
+# final assembly now live in tools/comment_assembler.CommentAssembler — resolved
+# ONCE per build and threaded into the section builders below as explicit
+# `compact` / `caps` params, instead of every builder re-reading the env var and
+# re-deriving "_COMPACT_x if compact else <inline literal>" on its own.
+from tools.comment_assembler import CommentAssembler
 
 
 def _truncate(s: str, limit: int) -> str:
@@ -518,7 +516,7 @@ def _format_sgt(raw: str) -> str:
         return str(raw)
 
 
-def _ip_origin_lines(vt: dict | None, ab: dict | None) -> list[str]:
+def _ip_origin_lines(vt: dict | None, ab: dict | None, *, compact: bool) -> list[str]:
     """Build the per-IP Origin block for the L1 Triage comment. Combines
     AbuseIPDB and VirusTotal metadata so the analyst sees who owns the IP
     and where it sits without expanding raw payloads. Returns 0 lines if no
@@ -553,7 +551,7 @@ def _ip_origin_lines(vt: dict | None, ab: dict | None) -> list[str]:
     if usage_type:
         origin_parts.append(f"Usage: {usage_type}")
 
-    if _compact_comments():
+    if compact:
         # One line, unlabelled: country, owner, first PTR. Network/usage/domain
         # are dropped — an analyst who needs them opens the raw payload.
         bits: list[str] = []
@@ -587,17 +585,16 @@ def _ip_origin_lines(vt: dict | None, ab: dict | None) -> list[str]:
     return out
 
 
-def _append_insights_section(lines: list[str], ioc_results: list[dict] | None) -> None:
+def _append_insights_section(ioc_results: list[dict] | None, *, compact: bool, caps) -> list[str]:
     """Improvement #2 (2026-07-03): inject the AI web-research 'Additional Insights'
-    section for malicious IOCs. No-op unless a malicious IOC carries an ``insights``
-    note (only populated when IOC_INSIGHTS_ENABLED is on)."""
+    section for malicious IOCs. Returns [] unless a malicious IOC carries an
+    ``insights`` note (only populated when IOC_INSIGHTS_ENABLED is on)."""
     items = [((r.get("ioc") or {}).get("value", ""), r.get("insights"))
              for r in (ioc_results or [])
              if r.get("verdict") == "malicious" and r.get("insights")]
     if not items:
-        return
-    lines.append("Additional Insights (Open-Source Web Research):")
-    compact = _compact_comments()
+        return []
+    lines: list[str] = ["Additional Insights (Open-Source Web Research):"]
     for value, text in items:
         if compact:
             lines.append(f"  [{value}] {' '.join((text or '').split())}")
@@ -605,18 +602,18 @@ def _append_insights_section(lines: list[str], ioc_results: list[dict] | None) -
         lines.append(f"  [{value}]")
         lines.append(f"    {text}")
     lines.append("")
+    return lines
 
 
-def _append_cmdline_section(lines: list[str], cmdline_analysis: dict | None) -> None:
-    """Improvement #4 (2026-07-06): AI command-line reputation check. No-op unless
-    CMDLINE_ANALYSIS_ENABLED produced results. ADVISORY ONLY — never affects the
-    ticket verdict; it tells the analyst whether the process/PowerShell command
+def _append_cmdline_section(cmdline_analysis: dict | None, *, compact: bool, caps) -> list[str]:
+    """Improvement #4 (2026-07-06): AI command-line reputation check. Returns []
+    unless CMDLINE_ANALYSIS_ENABLED produced results. ADVISORY ONLY — never affects
+    the ticket verdict; it tells the analyst whether the process/PowerShell command
     line looks malicious or is legitimately associated with known software."""
     items = (cmdline_analysis or {}).get("items") or []
     if not items:
-        return
-    lines.append("Command-Line Analysis (AI + Open-Source Web Research):")
-    compact = _compact_comments()
+        return []
+    lines: list[str] = ["Command-Line Analysis (AI + Open-Source Web Research):"]
     for it in items:
         img = it.get("image") or "process"
         if compact:
@@ -634,17 +631,17 @@ def _append_cmdline_section(lines: list[str], cmdline_analysis: dict | None) -> 
             lines.append(f"    Parent: {it['parent_image']}")
         lines.append(f"    {it.get('analysis', '')}")
     lines.append("")
+    return lines
 
 
-def _append_code_explain_section(lines: list[str], code_explain: dict | None) -> None:
+def _append_code_explain_section(code_explain: dict | None, *, compact: bool, caps) -> list[str]:
     """Improvement #5 (2026-07-06): decode SIEM/XDR codes (Event IDs, Logon Types,
-    NTSTATUS, Kerberos failure codes). No-op unless CODE_EXPLAIN_ENABLED produced
-    items. Advisory only — never affects the verdict."""
+    NTSTATUS, Kerberos failure codes). Returns [] unless CODE_EXPLAIN_ENABLED
+    produced items. Advisory only — never affects the verdict."""
     items = (code_explain or {}).get("items") or []
     if not items:
-        return
-    lines.append("Security Code Explanations:")
-    compact = _compact_comments()
+        return []
+    lines: list[str] = ["Security Code Explanations:"]
     for it in items:
         src = " (web)" if it.get("source") == "web" else ""
         head = f"  [{it.get('label', '')}] {it.get('code', '')}{src}"
@@ -654,24 +651,24 @@ def _append_code_explain_section(lines: list[str], code_explain: dict | None) ->
         lines.append(head)
         lines.append(f"    {it.get('meaning', '')}")
     lines.append("")
+    return lines
 
 
-def _append_mitre_section(lines: list[str], mitre_result: dict | None) -> None:
-    """Inject MITRE ATT&CK section into lines in-place. No-op if result is absent."""
+def _append_mitre_section(mitre_result: dict | None, *, compact: bool, caps) -> list[str]:
+    """Build the MITRE ATT&CK section lines. Returns [] if result is absent."""
     if not mitre_result:
-        return
+        return []
     techniques = mitre_result.get("techniques") or []
     if not techniques:
-        return
-    lines.append("MITRE ATT&CK — Attack TTPs:")
-    compact = _compact_comments()
+        return []
+    lines: list[str] = ["MITRE ATT&CK — Attack TTPs:"]
     for t in techniques:
         pct = int(round(t.get("confidence", 0) * 100))
         if compact:
             # One line per technique. The bare attack.mitre.org URL is dropped —
             # the technique ID is enough to look up, and it cost a full line
             # each. The ADF path keeps the link on the ID itself, where it's free.
-            rationale = _truncate(t.get("rationale") or "", _COMPACT_SNIPPET_CHARS)
+            rationale = _truncate(t.get("rationale") or "", caps.snippet_chars)
             why = f" — {rationale}" if rationale else ""
             lines.append(f"  [{t['id']}] {t['tactic']} — {t['name']} ({pct}%){why}")
             continue
@@ -681,9 +678,10 @@ def _append_mitre_section(lines: list[str], mitre_result: dict | None) -> None:
             lines.append(f"    Why: {rationale}")
         lines.append(f"    {_mitre_technique_url(t['id'])}")
     lines.append("")
+    return lines
 
 
-def _append_sentinel_evidence_section(lines: list[str], kql_result: dict | None) -> None:
+def _append_sentinel_evidence_section(kql_result: dict | None, *, compact: bool, caps) -> list[str]:
     """Phase 5 (2026-06-15): inject the 'Sentinel Evidence' RAG-style block
     into the enrichment comment. No-op when kql_result is None or has no
     queries (KQL expansion disabled, customer has no Sentinel workspace,
@@ -693,17 +691,19 @@ def _append_sentinel_evidence_section(lines: list[str], kql_result: dict | None)
     prompt — same conservative ladder as Phase 4 → 4c (separate killswitch
     + threshold for prompt integration if/when we add Phase 5c)."""
     if not kql_result:
-        return
+        return []
     queries = kql_result.get("queries") or []
     if not queries:
-        return
+        return []
 
     workspace = kql_result.get("workspace_name") or "(unnamed)"
     iters = kql_result.get("iterations", len(queries))
     total = kql_result.get("total_rows", 0)
     iter_word = "iteration" if iters == 1 else "iterations"
     row_word = "row" if total == 1 else "rows"
-    lines.append(f"Sentinel Evidence ({workspace} — {iters} {iter_word}, {total} {row_word} total):")
+    lines: list[str] = [
+        f"Sentinel Evidence ({workspace} — {iters} {iter_word}, {total} {row_word} total):"
+    ]
 
     for q in queries:
         i = q.get("iteration", 0)
@@ -716,13 +716,13 @@ def _append_sentinel_evidence_section(lines: list[str], kql_result: dict | None)
         # logs if an analyst needs to reproduce.
         prefix = f"  [{i}] {table}: {row_count} {rc_word}"
         if rationale:
-            cap = _COMPACT_RATIONALE_CHARS if _compact_comments() else 200
-            prefix += f" — {_truncate(rationale, cap)}"
+            prefix += f" — {_truncate(rationale, caps.rationale_chars)}"
         lines.append(prefix)
     lines.append("")
+    return lines
 
 
-def _append_customer_knowledge_section(lines: list[str], rag_info: dict | None) -> None:
+def _append_customer_knowledge_section(rag_info: dict | None, *, compact: bool, caps) -> list[str]:
     """Phase 4 / 4b (2026-06-13 → 2026-06-15): inject the 'Customer Knowledge
     Base (Confluence)' block into the enrichment comment.
 
@@ -743,13 +743,15 @@ def _append_customer_knowledge_section(lines: list[str], rag_info: dict | None) 
     LLM Triage prompt (deliberate isolation against the prior failure mode
     where bad retrievals confused the LLM)."""
     if not rag_info:
-        return
+        return []
     pages = int(rag_info.get("pages_searched") or 0)
     if pages <= 0:
-        return
+        return []
     chunks = list(rag_info.get("chunks") or [])
     page_word = "page" if pages == 1 else "pages"
-    lines.append(f"Customer Knowledge Base (Confluence) — searched {pages} {page_word}:")
+    lines: list[str] = [
+        f"Customer Knowledge Base (Confluence) — searched {pages} {page_word}:"
+    ]
     if not chunks:
         lines.append("  ► No relevant matches above similarity threshold.")
     else:
@@ -762,18 +764,18 @@ def _append_customer_knowledge_section(lines: list[str], rag_info: dict | None) 
             # Single-line render: collapse internal whitespace + trim
             # aggressively so the comment stays scannable. Full chunk is
             # in the vector store if an analyst needs the full context.
-            cap = _COMPACT_SNIPPET_CHARS if _compact_comments() else 240
-            lines.append(f"  ► [{source}] {_truncate(text, cap)} — {score:.2f}")
+            lines.append(f"  ► [{source}] {_truncate(text, caps.snippet_chars)} — {score:.2f}")
     lines.append("")
+    return lines
 
 
-def _append_historical_section(lines: list[str], historical: dict | None) -> None:
+def _append_historical_section(historical: dict | None, *, compact: bool, caps) -> list[str]:
     """Phase 3 (2026-06-13): inject the 'Similar Alerts (past 24h)' block
-    into the enrichment comment. No-op when historical is None or total=0
+    into the enrichment comment. Returns [] when historical is None or total=0
     (first-time occurrence — adding a "Similar Alerts: 0" line would be
     noise, not signal)."""
     if not historical or historical.get("total", 0) <= 0:
-        return
+        return []
     window = historical.get("window_hours", 24)
     total = historical["total"]
     tp = historical.get("true_positive", 0)
@@ -783,7 +785,7 @@ def _append_historical_section(lines: list[str], historical: dict | None) -> Non
     prefix = historical.get("rule_prefix") or ""
     first_seen = _format_sgt(historical.get("first_seen_at") or "")
 
-    lines.append(f"Similar Alerts (past {window}h): {total}")
+    lines: list[str] = [f"Similar Alerts (past {window}h): {total}"]
     lines.append(f"  ├─ True-Positive:  {tp}")
     lines.append(f"  ├─ Benign-Positive: {fp}")
     lines.append(f"  ├─ Unknown:        {unk}")
@@ -794,6 +796,7 @@ def _append_historical_section(lines: list[str], historical: dict | None) -> Non
     if first_seen:
         lines.append(f"  Earliest sibling: {first_seen}")
     lines.append("")
+    return lines
 
 
 _TIMING_DISPLAY = {
@@ -804,24 +807,23 @@ _TIMING_DISPLAY = {
 }
 
 
-def _append_pattern_section(lines: list[str], pattern: dict | None) -> None:
+def _append_pattern_section(pattern: dict | None, *, compact: bool, caps) -> list[str]:
     """Alert Pattern Analysis (30d): frequency, verdict history, business-hours
-    timing and the deterministic tuning recommendation. No-op when pattern is
+    timing and the deterministic tuning recommendation. Returns [] when pattern is
     None. Unlike the 24h historical block, total=0 still renders a one-liner
     when this is the first occurrence of the rule ever — that IS signal."""
     if not pattern:
-        return
+        return []
     days = pattern.get("window_days", 30)
     total = int(pattern.get("total") or 0)
     if total <= 0:
         if not pattern.get("first_seen_ever"):
-            lines.append(f"Alert Pattern Analysis ({days}d): first occurrence of this rule "
-                         f"— no prior similar alerts found")
-            lines.append("")
-        return
+            return [f"Alert Pattern Analysis ({days}d): first occurrence of this rule "
+                    f"— no prior similar alerts found", ""]
+        return []
 
     total_str = f"{total}+" if pattern.get("truncated") else str(total)
-    lines.append(f"Alert Pattern Analysis ({days}d): {total_str} alerts")
+    lines: list[str] = [f"Alert Pattern Analysis ({days}d): {total_str} alerts"]
     lines.append(f"  ├─ True-Positive:  {pattern.get('true_positive', 0)}")
     lines.append(f"  ├─ Benign-Positive: {pattern.get('false_positive', 0)}")
     lines.append(f"  ├─ Unknown:        {pattern.get('unknown', 0)}")
@@ -863,10 +865,11 @@ def _append_pattern_section(lines: list[str], pattern: dict | None) -> None:
         lines.append(f"  TUNING CANDIDATE ({tuning.get('strength', 'moderate')}): "
                      f"{tuning.get('rationale', '')}")
     lines.append("")
+    return lines
 
 
-def _append_alert_history_section(lines: list[str], historical: dict | None,
-                                  pattern: dict | None) -> None:
+def _append_alert_history_section(historical: dict | None, pattern: dict | None,
+                                  *, compact: bool, caps) -> list[str]:
     """Single entry point for both verdict-history blocks.
 
     In full mode this is a pass-through that renders the 24h and 30d sections
@@ -880,11 +883,11 @@ def _append_alert_history_section(lines: list[str], historical: dict | None,
     benign* — the rest is background. Tuning candidacy survives in full because
     it is the one actionable output of the 30d window.
     """
-    if not _compact_comments():
-        _append_historical_section(lines, historical)
-        _append_pattern_section(lines, pattern)
-        return
+    if not compact:
+        return (_append_historical_section(historical, compact=compact, caps=caps)
+                + _append_pattern_section(pattern, compact=compact, caps=caps))
 
+    lines: list[str] = []
     body: list[str] = []
 
     if historical and historical.get("total", 0) > 0:
@@ -935,16 +938,16 @@ def _append_alert_history_section(lines: list[str], historical: dict | None,
         lines.append("Alert history:")
         lines.extend(body)
         lines.append("")
+    return lines
 
 
-def _append_whitelist_match_section(lines: list[str], matches: list[dict] | None) -> None:
+def _append_whitelist_match_section(matches: list[dict] | None, *, compact: bool, caps) -> list[str]:
     """Phase 5e (2026-06-16): direct (literal substring) IOC hits in the
     customer's Confluence chunks. Surfaces whitelist + reference-table
     matches that vector RAG misses because tabular data embeds poorly."""
     if not matches:
-        return
-    lines.append(f"Direct Whitelist Match ({len(matches)}):")
-    compact = _compact_comments()
+        return []
+    lines: list[str] = [f"Direct Whitelist Match ({len(matches)}):"]
     for m in matches:
         ioc_type = (m.get("ioc_type") or "?").upper()
         head = f"  ► [{ioc_type}] {m.get('ioc','')} — {m.get('source','')}"
@@ -952,18 +955,19 @@ def _append_whitelist_match_section(lines: list[str], matches: list[dict] | None
         if compact:
             # Fold the context onto the match line — the source name plus a
             # short quote is enough to judge whether the whitelist entry applies.
-            ctx = f" « {_truncate(snippet, _COMPACT_SNIPPET_CHARS)} »" if snippet else ""
+            ctx = f" « {_truncate(snippet, caps.snippet_chars)} »" if snippet else ""
             lines.append(head + ctx)
             continue
         lines.append(head)
         if snippet:
             lines.append(f"      « {snippet} »")
     lines.append("")
+    return lines
 
 
 # ─── Improvement #3 (2026-07-03) — known-activity advisory + whitelist conflict ──
 
-def _known_activity_top_chunk(rag_info: dict | None):
+def _known_activity_top_chunk(rag_info: dict | None, *, caps):
     """Return (snippet, source, score) for the single strongest customer-Confluence
     chunk when it clears KNOWN_ACTIVITY_ADVISORY_MIN_SCORE, else None. Gated by
     KNOWN_ACTIVITY_ADVISORY_ENABLED. Used only for the advisory box — never the verdict."""
@@ -982,34 +986,37 @@ def _known_activity_top_chunk(rag_info: dict | None):
         except (TypeError, ValueError):
             continue
         if sc >= min_score and (best is None or sc > best[2]):
-            cap = _COMPACT_SNIPPET_CHARS if _compact_comments() else 240
-            best = (_truncate(c.get("text") or "", cap),
+            best = (_truncate(c.get("text") or "", caps.snippet_chars),
                     c.get("source") or "Confluence", sc)
     return best
 
 
-def _append_known_activity_advisory(lines: list[str], rag_info: dict | None) -> None:
-    top = _known_activity_top_chunk(rag_info)
+def _append_known_activity_advisory(rag_info: dict | None, *, compact: bool, caps) -> list[str]:
+    top = _known_activity_top_chunk(rag_info, caps=caps)
     if not top:
-        return
+        return []
     snippet, source, score = top
-    lines.append("KNOWN ACTIVITY (Customer Confluence) — this alert pattern is documented as known/expected:")
-    lines.append(f"  ► [{source}] {snippet} (score {score:.2f})")
-    lines.append("")
+    return [
+        "KNOWN ACTIVITY (Customer Confluence) — this alert pattern is documented as known/expected:",
+        f"  ► [{source}] {snippet} (score {score:.2f})",
+        "",
+    ]
 
 
-def _append_whitelist_conflict(lines: list[str], whitelist_conflict: list[dict] | None) -> None:
+def _append_whitelist_conflict(whitelist_conflict: list[dict] | None, *, compact: bool, caps) -> list[str]:
     if not whitelist_conflict:
-        return
+        return []
+    lines: list[str] = []
     for m in whitelist_conflict:
         lines.append(f"WHITELIST CONFLICT: {m.get('ioc', '')} is whitelisted in Confluence but "
                      f"flagged malicious by threat intel — treated as True-Positive (possible "
                      f"stale whitelist or compromised asset); verify.")
     lines.append("")
+    return lines
 
 
-def _adf_known_activity_block(rag_info: dict | None) -> list[dict]:
-    top = _known_activity_top_chunk(rag_info)
+def _adf_known_activity_block(rag_info: dict | None, *, compact: bool, caps) -> list[dict]:
+    top = _known_activity_top_chunk(rag_info, caps=caps)
     if not top:
         return []
     from tools import adf
@@ -1049,8 +1056,14 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
                    code_explain: dict | None = None,
                    ticket_key: str = "",
                    pattern: dict | None = None) -> str:
+    # Resolve verbosity + truncation caps ONCE for this build; thread compact/caps
+    # into every section builder instead of each re-reading the env var.
+    assembler = CommentAssembler()
+    compact, caps = assembler.compact, assembler.caps
+
     lines: list[str] = []
-    _append_known_activity_advisory(lines, rag_info)   # Improvement #3: top advisory box
+    # Improvement #3: top advisory box (never collapsed, in any mode).
+    lines += _append_known_activity_advisory(rag_info, compact=compact, caps=caps)
     lines += ["=== L1 Triage Report (Automated) ===", ""]
     verdict_display = _VERDICT_LABEL.get(overall_verdict, overall_verdict.upper())
 
@@ -1059,7 +1072,7 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
         # consistency with tickets that DO have IOCs. The triage outcome is
         # Unknown (we can't confirm or refute without observables); the ticket
         # is routed to L2 for analyst review.
-        if _compact_comments():
+        if compact:
             # 2026-08-05: the three "No detections" lines below used to render
             # here for shape-consistency with tickets that DO have IOCs. They
             # read as three engines clearing the ticket when nothing was ever
@@ -1073,27 +1086,27 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
                 "  - SOCRadar:    No detections",
                 "",
             ]
-        _append_mitre_section(lines, mitre_result)
-        _append_whitelist_match_section(lines, whitelist_matches)
-        _append_customer_knowledge_section(lines, rag_info)
-        _append_sentinel_evidence_section(lines, kql_evidence)
-        _append_alert_history_section(lines, historical, pattern)
-        _append_cmdline_section(lines, cmdline_analysis)
-        _append_code_explain_section(lines, code_explain)
-        _append_whitelist_conflict(lines, whitelist_conflict)
+        lines += _append_mitre_section(mitre_result, compact=compact, caps=caps)
+        lines += _append_whitelist_match_section(whitelist_matches, compact=compact, caps=caps)
+        lines += _append_customer_knowledge_section(rag_info, compact=compact, caps=caps)
+        lines += _append_sentinel_evidence_section(kql_evidence, compact=compact, caps=caps)
+        lines += _append_alert_history_section(historical, pattern, compact=compact, caps=caps)
+        lines += _append_cmdline_section(cmdline_analysis, compact=compact, caps=caps)
+        lines += _append_code_explain_section(code_explain, compact=compact, caps=caps)
+        lines += _append_whitelist_conflict(whitelist_conflict, compact=compact, caps=caps)
         lines += [
             f"VERDICT: {verdict_display}",
             f"AUTO-TRIAGE: {action_taken}",
         ]
         if recommendation:
             lines.append(f"RECOMMENDED ACTION: {recommendation}")
-        return "\n".join(lines)
+        return assembler.render_plain(lines)
 
     # An "IOC" here means an observable that at least one reputation engine flagged
     # as malicious. Observables that all engines cleared (or returned no data for)
     # are still listed below for analyst visibility but don't bump the IOC count.
     ioc_count = sum(1 for r in ioc_results if r.get("verdict") == "malicious")
-    if _compact_comments():
+    if compact:
         lines.append(f"IOCs found: {ioc_count} of {len(ioc_results)} observables checked")
     else:
         lines.append(f"IOCs found: {ioc_count}")
@@ -1102,7 +1115,7 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
 
     # TTP update (2026-07-10): MITRE section first, mirroring the ADF layout —
     # renders only on malicious verdicts now.
-    _append_mitre_section(lines, mitre_result)
+    lines += _append_mitre_section(mitre_result, compact=compact, caps=caps)
 
     # Phase 5b (2026-06-15): per-IOC historical lookup budget. Each malicious
     # IOC may consume one JQL call; cap protects webhook latency. Same shape
@@ -1117,7 +1130,6 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
     # a full block. The rest collapse to one line at the end of the list — on a
     # ticket with 6 observables where 5 came back clean that reclaims ~55 lines
     # while still recording every value that was checked.
-    compact = _compact_comments()
     if compact:
         flagged = [r for r in ioc_results if r.get("verdict") in ("malicious", "suspicious")]
         cleared = [r for r in ioc_results if r.get("verdict") not in ("malicious", "suspicious")]
@@ -1136,7 +1148,7 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
         # historically display, so analysts see "Microsoft Azure IP from US"
         # at a glance instead of digging through raw payloads.
         if ioc["type"] == "ip":
-            lines.extend(_ip_origin_lines(vt, ab))
+            lines.extend(_ip_origin_lines(vt, ab, compact=compact))
 
         if vt:
             mal = vt.get("malicious_count", 0)
@@ -1173,8 +1185,7 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
             if compact and result.get("verdict") != "malicious":
                 findings = []
             else:
-                cap = _COMPACT_SOCRADAR_FINDINGS if compact else 3
-                findings = (sr.get("top_findings") or [])[:cap]
+                findings = (sr.get("top_findings") or [])[:caps.socradar_findings]
             for f in findings:
                 src = f.get("source") or "?"
                 cat = f.get("category") or "?"
@@ -1209,19 +1220,19 @@ def _build_comment(ioc_results: list[dict], overall_verdict: str, action_taken: 
         lines.append(f"Cleared by all engines ({len(cleared)}): {values}")
         lines.append("")
 
-    _append_whitelist_match_section(lines, whitelist_matches)
-    _append_customer_knowledge_section(lines, rag_info)
-    _append_sentinel_evidence_section(lines, kql_evidence)
-    _append_alert_history_section(lines, historical, pattern)
-    _append_insights_section(lines, ioc_results)
-    _append_cmdline_section(lines, cmdline_analysis)
-    _append_code_explain_section(lines, code_explain)
-    _append_whitelist_conflict(lines, whitelist_conflict)
+    lines += _append_whitelist_match_section(whitelist_matches, compact=compact, caps=caps)
+    lines += _append_customer_knowledge_section(rag_info, compact=compact, caps=caps)
+    lines += _append_sentinel_evidence_section(kql_evidence, compact=compact, caps=caps)
+    lines += _append_alert_history_section(historical, pattern, compact=compact, caps=caps)
+    lines += _append_insights_section(ioc_results, compact=compact, caps=caps)
+    lines += _append_cmdline_section(cmdline_analysis, compact=compact, caps=caps)
+    lines += _append_code_explain_section(code_explain, compact=compact, caps=caps)
+    lines += _append_whitelist_conflict(whitelist_conflict, compact=compact, caps=caps)
     lines.append(f"VERDICT: {verdict_display}")
     lines.append(f"AUTO-TRIAGE: {action_taken}")
     if recommendation:
         lines.append(f"RECOMMENDED ACTION: {recommendation}")
-    return "\n".join(lines)
+    return assembler.render_plain(lines)
 
 
 # ─── Phase 5c (2026-06-16) — ADF table renderer ──────────────────────────────
@@ -1241,7 +1252,7 @@ _VERDICT_PANEL_TYPE = {
 }
 
 
-def _adf_ioc_block(ioc_results: list[dict], ticket_key: str) -> list[dict]:
+def _adf_ioc_block(ioc_results: list[dict], ticket_key: str, *, compact: bool, caps) -> list[dict]:
     """Build the ADF nodes for the per-IOC details section.
 
     Each malicious IOC gets its own subheading + 2-col key/value Origin
@@ -1266,7 +1277,6 @@ def _adf_ioc_block(ioc_results: list[dict], ticket_key: str) -> list[dict]:
     # 2026-08-05: mirrors the compact partition in _build_comment — a full
     # heading + origin table + reputation table per cleared observable is the
     # single largest source of length in this comment.
-    compact = _compact_comments()
     if compact:
         cleared = [r for r in ioc_results
                    if r.get("verdict") not in ("malicious", "suspicious")]
@@ -1335,8 +1345,7 @@ def _adf_ioc_block(ioc_results: list[dict], ticket_key: str) -> list[dict]:
             if compact and result.get("verdict") != "malicious":
                 findings = []
             else:
-                findings = (sr.get("top_findings") or [])[
-                    :(_COMPACT_SOCRADAR_FINDINGS if compact else 3)]
+                findings = (sr.get("top_findings") or [])[:caps.socradar_findings]
             for f in findings:
                 src = f.get("source") or "?"
                 cat = f.get("category") or "?"
@@ -1535,7 +1544,7 @@ def _adf_whitelist_match_block(matches: list[dict] | None) -> list[dict]:
     ]
 
 
-def _adf_sentinel_block(kql_result: dict | None) -> list[dict]:
+def _adf_sentinel_block(kql_result: dict | None, *, compact: bool, caps) -> list[dict]:
     from tools import adf
     if not kql_result:
         return []
@@ -1553,10 +1562,7 @@ def _adf_sentinel_block(kql_result: dict | None) -> list[dict]:
         i = q.get("iteration", 0)
         table_name = q.get("table") or "(unspecified)"
         row_count = q.get("row_count", 0)
-        rationale = _truncate(
-            q.get("rationale") or "",
-            _COMPACT_RATIONALE_CHARS if _compact_comments() else 200,
-        )
+        rationale = _truncate(q.get("rationale") or "", caps.rationale_chars)
         rows.append([str(i), table_name, str(row_count), rationale or "—"])
 
     return [
@@ -1568,7 +1574,7 @@ def _adf_sentinel_block(kql_result: dict | None) -> list[dict]:
     ]
 
 
-def _adf_customer_knowledge_block(rag_info: dict | None) -> list[dict]:
+def _adf_customer_knowledge_block(rag_info: dict | None, *, compact: bool, caps) -> list[dict]:
     from tools import adf
     if not rag_info:
         return []
@@ -1597,8 +1603,7 @@ def _adf_customer_knowledge_block(rag_info: dict | None) -> list[dict]:
             continue
         source = c.get("source") or "doc"
         score = float(c.get("score") or 0.0)
-        cap = _COMPACT_SNIPPET_CHARS if _compact_comments() else 240
-        rows.append([source, f"{score:.2f}", _truncate(text_val, cap)])
+        rows.append([source, f"{score:.2f}", _truncate(text_val, caps.snippet_chars)])
     blocks.append(adf.table(["Source", "Score", "Snippet"], rows))
     return blocks
 
@@ -1711,10 +1716,11 @@ def _adf_pattern_block(pattern: dict | None) -> list[dict]:
     return blocks
 
 
-def _adf_alert_history_blocks(historical: dict | None, pattern: dict | None) -> list[dict]:
+def _adf_alert_history_blocks(historical: dict | None, pattern: dict | None,
+                             *, compact: bool, caps) -> list[dict]:
     """ADF twin of _append_alert_history_section. Full mode renders the 24h and
     30d sections unchanged; compact merges them into one three-column table."""
-    if not _compact_comments():
+    if not compact:
         return _adf_historical_block(historical) + _adf_pattern_block(pattern)
 
     from tools import adf
@@ -1829,6 +1835,11 @@ def _build_comment_adf(ioc_results: list[dict], overall_verdict: str, action_tak
     signature as _build_comment() so callers don't change."""
     from tools import adf
 
+    # Resolve verbosity + truncation caps ONCE for this build; thread compact/caps
+    # into every ADF section builder instead of each re-reading the env var.
+    assembler = CommentAssembler()
+    compact, caps = assembler.compact, assembler.caps
+
     verdict_display = _VERDICT_LABEL.get(overall_verdict, overall_verdict.upper())
     panel_type = _VERDICT_PANEL_TYPE.get(overall_verdict, "note")
 
@@ -1844,7 +1855,6 @@ def _build_comment_adf(ioc_results: list[dict], overall_verdict: str, action_tak
             adf.paragraph(adf.text("RECOMMENDED ACTION: ", bold=True), adf.text(recommendation))
         )
 
-    compact = _compact_comments()
     if compact:
         signals = _key_signals(ioc_results, mitre_result, historical, pattern)
         if signals:
@@ -1855,7 +1865,7 @@ def _build_comment_adf(ioc_results: list[dict], overall_verdict: str, action_tak
     # Improvement #3: known-activity advisory as the FIRST block (top of comment),
     # verdict panel next, then the whitelist/threat-intel conflict warning (if any).
     blocks: list[dict] = []
-    blocks.extend(_adf_known_activity_block(rag_info))
+    blocks.extend(_adf_known_activity_block(rag_info, compact=compact, caps=caps))
     blocks.append(adf.panel(panel_type, *verdict_paras))
     blocks.extend(_adf_whitelist_conflict_block(whitelist_conflict))
     blocks.append(adf.heading(2, "L1 Triage Report (Automated)"))
@@ -1865,16 +1875,16 @@ def _build_comment_adf(ioc_results: list[dict], overall_verdict: str, action_tak
     # "TRUE-POSITIVE → here's the attack technique picture".
     if not compact:
         blocks.extend(_adf_mitre_block(mitre_result))
-        blocks.extend(_adf_ioc_block(ioc_results, ticket_key))
+        blocks.extend(_adf_ioc_block(ioc_results, ticket_key, compact=compact, caps=caps))
         blocks.extend(_adf_whitelist_match_block(whitelist_matches))
-        blocks.extend(_adf_customer_knowledge_block(rag_info))
-        blocks.extend(_adf_sentinel_block(kql_evidence))
+        blocks.extend(_adf_customer_knowledge_block(rag_info, compact=compact, caps=caps))
+        blocks.extend(_adf_sentinel_block(kql_evidence, compact=compact, caps=caps))
         blocks.extend(_adf_historical_block(historical))
         blocks.extend(_adf_pattern_block(pattern))
         blocks.extend(_adf_insights_block(ioc_results))
         blocks.extend(_adf_cmdline_block(cmdline_analysis))
         blocks.extend(_adf_code_explain_block(code_explain))
-        return adf.doc(*blocks)
+        return assembler.render_adf(blocks)
 
     # 2026-08-05 compact: same sections, same order, but demoted behind
     # collapsible expanders so the verdict panel is the whole of the first
@@ -1882,29 +1892,25 @@ def _build_comment_adf(ioc_results: list[dict], overall_verdict: str, action_tak
     #
     # The known-activity advisory, the verdict panel and the whitelist-conflict
     # warning above deliberately stay OUTSIDE any expander — a reader who never
-    # clicks must still see them.
-    def _expand(title: str, *groups: list[dict]) -> list[dict]:
-        inner = [b for g in groups for b in g]
-        return [adf.expand(title, *inner)] if inner else []
-
+    # clicks must still see them. The assembler owns the expander helper.
     technique_count = len((mitre_result or {}).get("techniques") or [])
-    blocks += _expand(f"MITRE ATT&CK ({technique_count})",
-                      _adf_mitre_block(mitre_result))
-    blocks += _expand(f"Observables ({len(ioc_results or [])})",
-                      _adf_ioc_block(ioc_results, ticket_key))
-    blocks += _expand("Alert history",
-                      _adf_alert_history_blocks(historical, pattern))
-    blocks += _expand("Customer knowledge & whitelist",
-                      _adf_whitelist_match_block(whitelist_matches),
-                      _adf_customer_knowledge_block(rag_info))
-    blocks += _expand("Sentinel evidence",
-                      _adf_sentinel_block(kql_evidence))
-    blocks += _expand("Command-line & code analysis",
-                      _adf_insights_block(ioc_results),
-                      _adf_cmdline_block(cmdline_analysis),
-                      _adf_code_explain_block(code_explain))
+    blocks += assembler.expand(f"MITRE ATT&CK ({technique_count})",
+                               _adf_mitre_block(mitre_result))
+    blocks += assembler.expand(f"Observables ({len(ioc_results or [])})",
+                               _adf_ioc_block(ioc_results, ticket_key, compact=compact, caps=caps))
+    blocks += assembler.expand("Alert history",
+                               _adf_alert_history_blocks(historical, pattern, compact=compact, caps=caps))
+    blocks += assembler.expand("Customer knowledge & whitelist",
+                               _adf_whitelist_match_block(whitelist_matches),
+                               _adf_customer_knowledge_block(rag_info, compact=compact, caps=caps))
+    blocks += assembler.expand("Sentinel evidence",
+                               _adf_sentinel_block(kql_evidence, compact=compact, caps=caps))
+    blocks += assembler.expand("Command-line & code analysis",
+                               _adf_insights_block(ioc_results),
+                               _adf_cmdline_block(cmdline_analysis),
+                               _adf_code_explain_block(code_explain))
 
-    return adf.doc(*blocks)
+    return assembler.render_adf(blocks)
 
 
 # ─── Jira Actions ─────────────────────────────────────────────────────────────
