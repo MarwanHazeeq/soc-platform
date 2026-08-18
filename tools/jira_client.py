@@ -1,3 +1,40 @@
+"""Jira REST access and report-data derivation for the SOC platform.
+
+This module owns two concerns that Refactor 3 gave an explicit seam between:
+
+1. **REST primitives** — thin ``httpx.get`` wrappers that talk to the Jira
+   Cloud API (search, single-issue fetch, project issue-type discovery, and
+   per-month incident counting). These resolve per-customer auth via
+   :func:`_resolve_jira_auth` (Key Vault-backed through ``tools.secrets``),
+   never reading credentials straight from ``os.environ``.
+
+2. **Report derivation** — turning raw Jira issues into the stats/derived
+   structures the report templates and LLM prompt consume
+   (:func:`_compute_stats`, :func:`_compute_incident_derived_stats`), plus the
+   multi-project fan-out/merge orchestration.
+
+Two collaborator objects express that seam so the report side becomes testable
+without mocking HTTP:
+
+- :class:`JiraRestClient` — a stateless, per-call handle over the REST
+  primitives. ``project_spec`` is locked at construction so a client instance
+  is bound to one Jira instance/customer; concurrency (see
+  :func:`fetch_all_projects`) uses one client per thread. Its methods delegate
+  to the module-level primitive functions *by name at call time*, so tests that
+  rebind e.g. ``jira_client.jira_search`` still intercept the call.
+
+- :class:`JiraReportPipeline` — depends on a ``JiraRestClient`` (or a stub with
+  the same surface) and reaches HTTP only through ``self._client``. It owns the
+  incident/SR/CR fetches, the 12-month trend, and the multi-project merge.
+
+The historical **module-level function API is preserved as a facade** over a
+shared ``_PIPELINE`` instance: all ~20 public names keep their exact current
+signatures so the 11 external callers work with zero import changes, and the
+existing tests keep their monkeypatch points (name rebinding at module scope).
+``_compute_stats`` and ``_compute_incident_derived_stats`` stay pure
+module-level functions — imported directly by ``tools/test_pending_by_entity``.
+"""
+
 import os
 import csv
 import json
@@ -1197,3 +1234,146 @@ def fetch_all_projects(customer_record: dict, start_date: str, end_date: str,
                 })
 
     return _merge_project_results(results)
+
+
+# ── Seam objects (Refactor 3) ────────────────────────────────────────────────
+#
+# JiraRestClient and JiraReportPipeline give the REST layer and the report
+# layer an explicit boundary so report derivation is stub-testable. They are a
+# thin object layer OVER the module-level functions above, not a reimplementation
+# of them: every method delegates to the module-global function BY NAME at call
+# time (looked up via globals()[...] / the bare name), never by capturing a
+# bound reference at construction. That is load-bearing — the existing tests
+# rebind module-level names such as ``jira_client.jira_search`` and
+# ``jira_client._get_project_issue_type_names`` and then invoke the report
+# functions, so the interception only works if resolution is late. The
+# module-level functions remain the real implementations and the primary,
+# monkeypatchable API; these classes and the ``_PIPELINE`` facade below sit on
+# top without changing any signature or import surface.
+
+
+class JiraRestClient:
+    """Stateless handle over the Jira REST primitives for one Jira instance.
+
+    ``project_spec`` is locked at construction (per-call in the sense that a
+    single client is bound to one customer/instance and passed the same spec on
+    every REST call) — resolution of ``base_url`` / auth still happens inside
+    the module-level primitives via :func:`_resolve_jira_auth`, honouring the
+    Key Vault credential boundary. Concurrency (:func:`fetch_all_projects`
+    fan-out) constructs one client per project/thread rather than sharing a
+    single instance; the ``_project_issue_types_cache`` it reads stays
+    MODULE-LEVEL so the type-name cache is shared across those per-thread
+    clients for the process lifetime.
+
+    Every method resolves its target module-level function by name at call time
+    (``globals()[...]``) so test monkeypatches that rebind those names are
+    honoured.
+    """
+
+    def __init__(self, project_spec: dict | None = None):
+        self._project_spec = project_spec
+
+    def search(self, jql: str, max_results: int = 100,
+               next_page_token: str | None = None) -> dict:
+        return globals()["jira_search"](
+            jql, max_results=max_results, next_page_token=next_page_token,
+            project_spec=self._project_spec,
+        )
+
+    def fetch_issue(self, key: str, fields: str = "*all") -> dict | None:
+        return globals()["fetch_issue_by_key"](key, fields=fields)
+
+    def fetch_project_issue_types(self, project_key: str) -> list[str] | None:
+        return globals()["_get_project_issue_type_names"](
+            project_key, project_spec=self._project_spec,
+        )
+
+    def fetch_month_count(self, project_key: str, month_start: str,
+                          month_end: str,
+                          issue_type: str = DEFAULT_INCIDENT_ISSUE_TYPE) -> int:
+        return globals()["_fetch_month_count"](
+            project_key, month_start, month_end,
+            issue_type=issue_type, project_spec=self._project_spec,
+        )
+
+
+class JiraReportPipeline:
+    """Report-data derivation that depends on a :class:`JiraRestClient` (or a
+    stub exposing ``.search`` / ``.fetch_issue`` / ``.fetch_project_issue_types``
+    / ``.fetch_month_count``).
+
+    Reaches HTTP ONLY via ``self._client`` — it never calls ``httpx.get``
+    directly. The per-project ``project_spec`` for a given report run is carried
+    by the client, so the pipeline methods forward the caller-supplied
+    ``project_spec`` down to the module-level functions (which construct a
+    matching client) to keep the facade signatures identical. The pure
+    derivation functions ``_compute_stats`` and ``_compute_incident_derived_stats``
+    stay module-level and unchanged.
+    """
+
+    def __init__(self, client: JiraRestClient | None = None):
+        self._client = client or JiraRestClient()
+
+    # -- incidents ------------------------------------------------------------
+    def fetch_incidents_for_report(self, project_key: str, start_date: str,
+                                   end_date: str,
+                                   incident_issue_type: str = DEFAULT_INCIDENT_ISSUE_TYPE,
+                                   project_spec: dict | None = None) -> dict:
+        return globals()["fetch_incidents_for_report"](
+            project_key, start_date, end_date,
+            incident_issue_type=incident_issue_type, project_spec=project_spec,
+        )
+
+    def fetch_incidents_from_csv(self, project_key: str, start_date: str,
+                                 end_date: str,
+                                 csv_path: str | None = None) -> dict:
+        return globals()["fetch_incidents_from_csv"](
+            project_key, start_date, end_date, csv_path=csv_path,
+        )
+
+    # -- service / change requests -------------------------------------------
+    def fetch_service_requests(self, project_key: str, start_date: str,
+                               end_date: str,
+                               issue_type: str = "Service Request",
+                               project_spec: dict | None = None) -> dict:
+        return globals()["fetch_service_requests"](
+            project_key, start_date, end_date,
+            issue_type=issue_type, project_spec=project_spec,
+        )
+
+    def fetch_change_requests(self, project_key: str, start_date: str,
+                              end_date: str, issue_type: str = "Change",
+                              project_spec: dict | None = None) -> dict:
+        return globals()["fetch_change_requests"](
+            project_key, start_date, end_date,
+            issue_type=issue_type, project_spec=project_spec,
+        )
+
+    # -- 12-month trend -------------------------------------------------------
+    def fetch_monthly_counts_12m(self, project_key: str, end_date: str,
+                                 incident_issue_type: str = DEFAULT_INCIDENT_ISSUE_TYPE,
+                                 project_spec: dict | None = None) -> dict:
+        return globals()["fetch_monthly_counts_12m"](
+            project_key, end_date,
+            incident_issue_type=incident_issue_type, project_spec=project_spec,
+        )
+
+    # -- multi-project orchestration -----------------------------------------
+    def fetch_all_projects(self, customer_record: dict, start_date: str,
+                           end_date: str, sections: list[str],
+                           csv_path: str | None = None,
+                           project_filter: str | None = None) -> dict:
+        return globals()["fetch_all_projects"](
+            customer_record, start_date, end_date, sections,
+            csv_path=csv_path, project_filter=project_filter,
+        )
+
+    def _merge_project_results(self, results: list[dict]) -> dict:
+        return globals()["_merge_project_results"](results)
+
+
+# Shared module-level pipeline instance backing the facade. Callers keep using
+# the module-level functions (unchanged); this instance exists so new code can
+# depend on the object interface, and so the pipeline's HTTP access is
+# expressible through a single shared client for the default (env-cred) path.
+_PIPELINE = JiraReportPipeline()
