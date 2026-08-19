@@ -1,5 +1,5 @@
-"""Standalone tests for routes/webhook.py::_await_ticket_ready — the Jira-fetch
-wait that _run_enrichment uses.
+"""Standalone tests for tools/triage_orchestrator.py::_await_ticket_ready — the
+Jira-fetch wait that run_enrichment uses.
 
 Run:  python tools/test_manual_triage_wait.py
 
@@ -10,14 +10,14 @@ populated them, e.g. SCDM-745). The webhook path must keep its adaptive poll:
 break early when entity data lands, and fall through to a timeout otherwise.
 
 No network, no real sleeps: fetch_issue_by_key / has_entity_data / time.sleep
-are all monkeypatched on the webhook module.
+are all monkeypatched on the orchestrator module.
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import routes.webhook as w
+import tools.triage_orchestrator as w
 
 _ISSUE = {"fields": {"summary": "post-deploy EICAR probe"}}
 

@@ -231,6 +231,64 @@ print("full mode is untouched (the rollback path):")
 check("full mode emits no expand nodes",
       not any(t == "expand" for t, _ in walk(full_adf)))
 
+# 2026-08-18 (Refactor 1 — comment assembler): structural/order regression net.
+# The prior suite checked line-count delta and content presence but nothing about
+# *section order* or completeness — exactly the property the mutate-in-place →
+# pure-function conversion is most likely to break (silently dropping or
+# reordering a section). This block pins the full-mode section sequence: every
+# expected section present, in this order, with no duplicates. Order is asserted
+# against the actual rendered output, not hand-transcribed, so it stays honest.
+print("full-mode plain text has every section, in order, with no duplicates:")
+
+# Stable line-start markers for each top-level section, in the order
+# _build_comment() emits them on the worst-case fixture (every section populated).
+EXPECTED_SECTIONS = [
+    ("known-activity advisory", "KNOWN ACTIVITY (Customer Confluence)"),
+    ("report header", "=== L1 Triage Report (Automated) ==="),
+    ("IOC summary", "IOCs found:"),
+    ("MITRE ATT&CK", "MITRE ATT&CK — Attack TTPs:"),
+    ("direct whitelist match", "Direct Whitelist Match ("),
+    ("customer knowledge base", "Customer Knowledge Base (Confluence)"),
+    ("sentinel evidence", "Sentinel Evidence ("),
+    ("similar alerts (24h)", "Similar Alerts (past 24h):"),
+    ("alert pattern analysis (30d)", "Alert Pattern Analysis (30d):"),
+    ("additional insights", "Additional Insights (Open-Source Web Research):"),
+    ("command-line analysis", "Command-Line Analysis (AI + Open-Source Web Research):"),
+    ("security code explanations", "Security Code Explanations:"),
+    ("whitelist conflict", "WHITELIST CONFLICT:"),
+    ("verdict", "VERDICT:"),
+    ("auto-triage", "AUTO-TRIAGE:"),
+    ("recommended action", "RECOMMENDED ACTION:"),
+]
+
+full_lines = full_txt.splitlines()
+
+
+def _first_index(marker):
+    """First 0-based line index whose text starts with `marker`, else -1."""
+    for idx, ln in enumerate(full_lines):
+        if ln.startswith(marker):
+            return idx
+    return -1
+
+
+def _count(marker):
+    return sum(1 for ln in full_lines if ln.startswith(marker))
+
+
+positions = []
+for label, marker in EXPECTED_SECTIONS:
+    idx = _first_index(marker)
+    check(f"section present: {label}", idx >= 0)
+    check(f"section appears exactly once: {label}", _count(marker) == 1)
+    positions.append(idx)
+
+# Every section that IS present must appear in the declared order. Comparing the
+# observed positions to their sorted copy catches any reordering.
+present = [p for p in positions if p >= 0]
+check("all sections render in the declared order",
+      present == sorted(present))
+
 print()
 print(f"{'FAILED' if fails else 'OK'} — {fails} failure(s)")
 sys.exit(1 if fails else 0)
