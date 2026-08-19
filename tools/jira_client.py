@@ -273,13 +273,21 @@ def _normalize_issue(issue: dict) -> dict:
     }
 
 
-def _fetch_all_pages(jql: str, project_spec: dict | None = None) -> list:
-    """Fetch all pages for a JQL query using cursor pagination."""
+def _fetch_all_pages(jql: str, project_spec: dict | None = None,
+                     client: "JiraRestClient | None" = None) -> list:
+    """Fetch all pages for a JQL query using cursor pagination.
+
+    REST goes through a :class:`JiraRestClient` (``client.search``), never a
+    direct ``httpx.get``. When no client is supplied, one bound to
+    ``project_spec`` is constructed — that keeps the module-level facade path
+    working. The pipeline passes its own ``self._client`` so a stub injected
+    into :class:`JiraReportPipeline` intercepts here with zero HTTP.
+    """
+    client = client or JiraRestClient(project_spec)
     all_issues = []
     next_token = None
     while len(all_issues) < 5000:
-        result = jira_search(jql, max_results=100, next_page_token=next_token,
-                             project_spec=project_spec)
+        result = client.search(jql, max_results=100, next_page_token=next_token)
         if "error" in result:
             logger.error(f"Jira fetch error: {result}")
             break
@@ -306,31 +314,11 @@ def _date_chunks(start_date: str, end_date: str):
 def fetch_incidents_for_report(project_key: str, start_date: str, end_date: str,
                                incident_issue_type: str = DEFAULT_INCIDENT_ISSUE_TYPE,
                                project_spec: dict | None = None) -> dict:
-    if USE_SAMPLE_DATA:
-        return fetch_incidents_from_csv(project_key, start_date, end_date)
-
-    seen_keys = set()
-    all_issues = []
-
-    for chunk_start, chunk_end in _date_chunks(start_date, end_date):
-        jql = (
-            f'{_incident_jql_filter(project_key, incident_issue_type)} '
-            f'AND created >= "{chunk_start}" '
-            f'AND created < "{chunk_end}" '
-            f'ORDER BY created DESC'
-        )
-        issues = _fetch_all_pages(jql, project_spec=project_spec)
-        for issue in issues:
-            key = issue.get("key")
-            if key and key not in seen_keys:
-                seen_keys.add(key)
-                all_issues.append(issue)
-
-    logger.info("fetch_incidents_for_report(%s): total=%d", project_key, len(all_issues))
-    incidents = [_normalize_issue(i) for i in all_issues]
-    stats = _compute_stats(incidents)
-    stats["derived"] = _compute_incident_derived_stats(incidents, end_date)
-    return {"incidents": incidents, "stats": stats}
+    """Facade — delegates to the shared pipeline (see :class:`JiraReportPipeline`)."""
+    return _PIPELINE.fetch_incidents_for_report(
+        project_key, start_date, end_date,
+        incident_issue_type=incident_issue_type, project_spec=project_spec,
+    )
 
 
 def _compute_stats(incidents: list[dict]) -> dict:
@@ -712,8 +700,16 @@ def fetch_incidents_from_csv(project_key: str, start_date: str, end_date: str,
 
 def _fetch_jira_by_type(issue_type: str, project_key: str,
                         start_date: str, end_date: str,
-                        project_spec: dict | None = None) -> dict:
-    """Generic Jira fetch by issue type. Returns {items, stats, unavailable}."""
+                        project_spec: dict | None = None,
+                        client: "JiraRestClient | None" = None) -> dict:
+    """Generic Jira fetch by issue type. Returns {items, stats, unavailable}.
+
+    REST goes through ``client.search`` (a :class:`JiraRestClient`), never a
+    direct ``httpx.get``. Kept module-level (and directly callable) because
+    ``test_issue_type_resolution`` invokes it with ``jira_search`` rebound — the
+    client late-binds ``jira_search`` so that monkeypatch still intercepts.
+    """
+    client = client or JiraRestClient(project_spec)
     seen_keys = set()
     all_issues = []
 
@@ -727,8 +723,7 @@ def _fetch_jira_by_type(issue_type: str, project_key: str,
         )
         next_token = None
         while len(all_issues) < 5000:
-            result = jira_search(jql, max_results=100, next_page_token=next_token,
-                                 project_spec=project_spec)
+            result = client.search(jql, max_results=100, next_page_token=next_token)
             if "error" in result:
                 if "HTTP 400" in result.get("error", "") or "HTTP 404" in result.get("error", ""):
                     logger.warning(f"Issue type '{issue_type}' not found in project {project_key}")
@@ -806,7 +801,8 @@ def _normalize_type_name(name: str) -> str:
 
 def _resolve_issue_type_for_project(configured: str, aliases: list[str],
                                     project_key: str,
-                                    project_spec: dict | None = None) -> str | None:
+                                    project_spec: dict | None = None,
+                                    client: "JiraRestClient | None" = None) -> str | None:
     """Map a configured issue type name onto the name the project actually uses.
 
     Returns the project's canonical name (exact-casing) on a match, the
@@ -814,8 +810,14 @@ def _resolve_issue_type_for_project(configured: str, aliases: list[str],
     (so behaviour degrades to the pre-validation JQL), or None when the type
     genuinely does not exist in the project — the caller marks the section
     unavailable so the report shows the "not configured" placeholder instead
-    of a false zero."""
-    names = _get_project_issue_type_names(project_key, project_spec)
+    of a false zero.
+
+    The project's type list is fetched through ``client.fetch_project_issue_types``
+    (a :class:`JiraRestClient`), which late-binds
+    ``_get_project_issue_type_names`` — so ``test_issue_type_resolution``'s
+    rebind of that module-level name still intercepts."""
+    client = client or JiraRestClient(project_spec)
+    names = client.fetch_project_issue_types(project_key)
     if names is None:
         return configured
     lookup: dict[str, str] = {}
@@ -844,18 +846,13 @@ def fetch_service_requests(project_key: str, start_date: str, end_date: str,
     "Service Desk Request") can override this per customer in the admin UI.
     The configured name is validated against the project's real issue types
     (with "[System] "-prefix-insensitive matching and alias fallback) so a
-    name mismatch yields unavailable=True rather than a silent zero."""
-    try:
-        resolved = _resolve_issue_type_for_project(
-            issue_type or "Service Request", _SERVICE_REQUEST_ALIASES,
-            project_key, project_spec)
-        if resolved is None:
-            return {"items": [], "stats": {}, "unavailable": True}
-        return _fetch_jira_by_type(resolved, project_key,
-                                   start_date, end_date, project_spec=project_spec)
-    except Exception as e:
-        logger.warning(f"fetch_service_requests exception: {e}")
-        return {"items": [], "stats": {}, "unavailable": True}
+    name mismatch yields unavailable=True rather than a silent zero.
+
+    Facade — delegates to the shared pipeline."""
+    return _PIPELINE.fetch_service_requests(
+        project_key, start_date, end_date,
+        issue_type=issue_type, project_spec=project_spec,
+    )
 
 
 def fetch_change_requests(project_key: str, start_date: str, end_date: str,
@@ -868,18 +865,13 @@ def fetch_change_requests(project_key: str, start_date: str, end_date: str,
     "Change Management". The configured name is validated against the
     project's real issue types (with "[System] "-prefix-insensitive matching
     and alias fallback) so a name mismatch yields unavailable=True rather
-    than a silent zero."""
-    try:
-        resolved = _resolve_issue_type_for_project(
-            issue_type or "Change", _CHANGE_REQUEST_ALIASES,
-            project_key, project_spec)
-        if resolved is None:
-            return {"items": [], "stats": {}, "unavailable": True}
-        return _fetch_jira_by_type(resolved, project_key,
-                                   start_date, end_date, project_spec=project_spec)
-    except Exception as e:
-        logger.warning(f"fetch_change_requests exception: {e}")
-        return {"items": [], "stats": {}, "unavailable": True}
+    than a silent zero.
+
+    Facade — delegates to the shared pipeline."""
+    return _PIPELINE.fetch_change_requests(
+        project_key, start_date, end_date,
+        issue_type=issue_type, project_spec=project_spec,
+    )
 
 
 # Sanity bound on the per-month pagination loop. Far above any plausible
@@ -948,30 +940,13 @@ def fetch_monthly_counts_12m(project_key: str, end_date: str,
     cannot cause the cursor to exhaust the page budget and starve earlier months.
     Each month is an independent paginated query — the same JQL filter used by
     fetch_incidents_for_report ensures consistency with the report data.
+
+    Facade — delegates to the shared pipeline.
     """
-    from dateutil.relativedelta import relativedelta
-
-    try:
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    except ValueError:
-        logger.warning("fetch_monthly_counts_12m: invalid end_date %s", end_date)
-        return {}
-
-    end_month = end_dt.replace(day=1)
-
-    monthly_counts: dict[str, int] = {}
-    for i in range(11, -1, -1):
-        m = end_month - relativedelta(months=i)
-        month_key = m.strftime("%Y-%m")
-        month_start = m.strftime("%Y-%m-%d")
-        month_end = (m + relativedelta(months=1)).strftime("%Y-%m-%d")
-        count = _fetch_month_count(project_key, month_start, month_end,
-                                   issue_type=incident_issue_type,
-                                   project_spec=project_spec)
-        monthly_counts[month_key] = count
-        logger.info("fetch_monthly_counts_12m(%s): %s = %d", project_key, month_key, count)
-
-    return monthly_counts
+    return _PIPELINE.fetch_monthly_counts_12m(
+        project_key, end_date,
+        incident_issue_type=incident_issue_type, project_spec=project_spec,
+    )
 
 
 # ── Multi-project orchestrator ───────────────────────────────────────────────
@@ -1109,51 +1084,14 @@ def _fetch_project_data(project_spec: dict, customer_record: dict,
     CSV path (where it has never been wired) and on callers that don't
     need it. Service / change requests are only fetched when the
     corresponding section was opted in.
+
+    Facade — delegates to the shared pipeline, which builds one
+    :class:`JiraRestClient` bound to ``project_spec`` for this project/thread.
     """
-    proj_key = (project_spec.get("project_key") or "").strip()
-    proj_name = (project_spec.get("name") or proj_key or "Primary").strip()
-
-    incident_issue_type = (customer_record.get("jira_incident_issuetype") or "").strip() \
-        or DEFAULT_INCIDENT_ISSUE_TYPE
-    sr_issue_type = (customer_record.get("jira_service_request_issuetype") or "").strip() \
-        or "Service Request"
-    cr_issue_type = (customer_record.get("jira_change_request_issuetype") or "").strip() \
-        or "Change"
-
-    if csv_path:
-        result = fetch_incidents_from_csv(proj_key, start_date, end_date, csv_path=csv_path)
-    else:
-        result = fetch_incidents_for_report(proj_key, start_date, end_date,
-                                            incident_issue_type=incident_issue_type,
-                                            project_spec=project_spec)
-
-    out: dict = {
-        "incidents": result.get("incidents") or [],
-        "stats": result.get("stats") or {},
-        "project_name": proj_name,
-        "project_key": proj_key,
-    }
-    if result.get("error"):
-        out["error"] = result["error"]
-
-    if "service_requests" in sections and proj_key:
-        out["service_requests"] = fetch_service_requests(
-            proj_key, start_date, end_date,
-            issue_type=sr_issue_type, project_spec=project_spec,
-        )
-    if "change_requests" in sections and proj_key:
-        out["change_requests"] = fetch_change_requests(
-            proj_key, start_date, end_date,
-            issue_type=cr_issue_type, project_spec=project_spec,
-        )
-    if not csv_path and proj_key and not skip_monthly_trend:
-        out["monthly_trend_12m"] = fetch_monthly_counts_12m(
-            proj_key, end_date,
-            incident_issue_type=incident_issue_type,
-            project_spec=project_spec,
-        )
-
-    return out
+    return _PIPELINE._fetch_project_data(
+        project_spec, customer_record, start_date, end_date, sections,
+        csv_path=csv_path, skip_monthly_trend=skip_monthly_trend,
+    )
 
 
 def fetch_all_projects(customer_record: dict, start_date: str, end_date: str,
@@ -1175,65 +1113,13 @@ def fetch_all_projects(customer_record: dict, start_date: str, end_date: str,
 
     ``project_filter``: when set, only the project whose ``name`` matches is
     fetched. Used by the per-project fanout path in routes/reports.py.
+
+    Facade — delegates to the shared pipeline.
     """
-    projects = customer_record.get("jira_projects") or []
-    if not projects:
-        # No Jira projects configured — return an empty shell so the caller
-        # can proceed with non-Jira sections. The downstream report flow
-        # already tolerates zero incidents.
-        return {"incidents": [], "stats": _compute_stats([])}
-
-    if project_filter:
-        projects = [p for p in projects if (p.get("name") or "") == project_filter]
-        if not projects:
-            logger.warning(
-                "fetch_all_projects: project_filter=%r matched no project in customer record",
-                project_filter,
-            )
-            return {"incidents": [], "stats": _compute_stats([])}
-
-    # Single-project shortcut keeps the legacy 1-project install path
-    # unchanged — no extra thread, no merge.
-    if len(projects) == 1:
-        return _fetch_project_data(
-            projects[0], customer_record, start_date, end_date, sections,
-            csv_path=csv_path,
-        )
-
-    logger.info(
-        "fetch_all_projects: fanning out across %d Jira projects for customer=%s",
-        len(projects), customer_record.get("id", "?"),
+    return _PIPELINE.fetch_all_projects(
+        customer_record, start_date, end_date, sections,
+        csv_path=csv_path, project_filter=project_filter,
     )
-    results: list[dict] = []
-    max_workers = min(4, len(projects))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(
-                _fetch_project_data, p, customer_record, start_date, end_date,
-                sections, csv_path,
-            ): p
-            for p in projects
-        }
-        for fut in as_completed(futures):
-            proj = futures[fut]
-            try:
-                results.append(fut.result())
-            except Exception as exc:
-                logger.error(
-                    "fetch_all_projects: project=%s raised %s; skipping",
-                    proj.get("name", "?"), exc,
-                )
-                # Carry an empty per-project result so the merge accounting
-                # is still correct (one entry per project, just empty).
-                results.append({
-                    "incidents": [],
-                    "stats": _compute_stats([]),
-                    "project_name": proj.get("name", ""),
-                    "project_key": proj.get("project_key", ""),
-                    "error": str(exc),
-                })
-
-    return _merge_project_results(results)
 
 
 # ── Seam objects (Refactor 3) ────────────────────────────────────────────────
@@ -1302,32 +1188,83 @@ class JiraReportPipeline:
     stub exposing ``.search`` / ``.fetch_issue`` / ``.fetch_project_issue_types``
     / ``.fetch_month_count``).
 
-    Reaches HTTP ONLY via ``self._client`` — it never calls ``httpx.get``
-    directly. The per-project ``project_spec`` for a given report run is carried
-    by the client, so the pipeline methods forward the caller-supplied
-    ``project_spec`` down to the module-level functions (which construct a
-    matching client) to keep the facade signatures identical. The pure
-    derivation functions ``_compute_stats`` and ``_compute_incident_derived_stats``
-    stay module-level and unchanged.
+    Reaches HTTP ONLY through a client — every REST call goes via
+    ``self._client_for(project_spec).search(...)`` (or ``.fetch_month_count`` /
+    ``.fetch_project_issue_types``); this class never calls ``httpx.get``, and
+    never calls the module-level ``jira_search`` / ``_fetch_month_count`` /
+    ``_get_project_issue_type_names`` directly. That is what makes report
+    derivation stub-testable: injecting a stub client into ``__init__`` diverts
+    all fetching to the stub with zero HTTP and zero monkeypatching.
+
+    Client selection (:meth:`_client_for`):
+
+    - If a client was *explicitly* injected at construction (the stub-test
+      path, ``JiraReportPipeline(client=stub)``), that one client is used for
+      every call regardless of the ``project_spec`` argument — the test drives
+      the whole pipeline through its single stub.
+    - Otherwise (the production ``_PIPELINE`` facade path, constructed with no
+      client) each call builds a fresh :class:`JiraRestClient` bound to the
+      call's ``project_spec`` — so multi-instance customers still get
+      per-project auth, and the :func:`fetch_all_projects` fan-out constructs
+      one client per project/thread.
+
+    The pure derivation functions ``_compute_stats`` /
+    ``_compute_incident_derived_stats`` and the merge/date helpers stay
+    module-level and are called directly (no I/O).
     """
 
     def __init__(self, client: JiraRestClient | None = None):
+        # Remember whether a client was *explicitly* injected — that decides
+        # _client_for's behaviour (fixed stub vs. per-spec construction).
+        self._injected_client = client
         self._client = client or JiraRestClient()
+
+    def _client_for(self, project_spec: dict | None) -> JiraRestClient:
+        """Client to use for a call. A stub injected at construction wins for
+        every call (test path); otherwise build one bound to ``project_spec``."""
+        if self._injected_client is not None:
+            return self._injected_client
+        return JiraRestClient(project_spec)
 
     # -- incidents ------------------------------------------------------------
     def fetch_incidents_for_report(self, project_key: str, start_date: str,
                                    end_date: str,
                                    incident_issue_type: str = DEFAULT_INCIDENT_ISSUE_TYPE,
                                    project_spec: dict | None = None) -> dict:
-        return globals()["fetch_incidents_for_report"](
-            project_key, start_date, end_date,
-            incident_issue_type=incident_issue_type, project_spec=project_spec,
-        )
+        if USE_SAMPLE_DATA:
+            return self.fetch_incidents_from_csv(project_key, start_date, end_date)
+
+        client = self._client_for(project_spec)
+        seen_keys = set()
+        all_issues = []
+
+        for chunk_start, chunk_end in _date_chunks(start_date, end_date):
+            jql = (
+                f'{_incident_jql_filter(project_key, incident_issue_type)} '
+                f'AND created >= "{chunk_start}" '
+                f'AND created < "{chunk_end}" '
+                f'ORDER BY created DESC'
+            )
+            issues = _fetch_all_pages(jql, client=client)
+            for issue in issues:
+                key = issue.get("key")
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    all_issues.append(issue)
+
+        logger.info("fetch_incidents_for_report(%s): total=%d",
+                    project_key, len(all_issues))
+        incidents = [_normalize_issue(i) for i in all_issues]
+        stats = _compute_stats(incidents)
+        stats["derived"] = _compute_incident_derived_stats(incidents, end_date)
+        return {"incidents": incidents, "stats": stats}
 
     def fetch_incidents_from_csv(self, project_key: str, start_date: str,
                                  end_date: str,
                                  csv_path: str | None = None) -> dict:
-        return globals()["fetch_incidents_from_csv"](
+        # CSV path does no REST — reads a local sample dump — so it stays a
+        # direct call to the module-level function; no client involved.
+        return fetch_incidents_from_csv(
             project_key, start_date, end_date, csv_path=csv_path,
         )
 
@@ -1336,44 +1273,193 @@ class JiraReportPipeline:
                                end_date: str,
                                issue_type: str = "Service Request",
                                project_spec: dict | None = None) -> dict:
-        return globals()["fetch_service_requests"](
-            project_key, start_date, end_date,
-            issue_type=issue_type, project_spec=project_spec,
-        )
+        client = self._client_for(project_spec)
+        try:
+            resolved = _resolve_issue_type_for_project(
+                issue_type or "Service Request", _SERVICE_REQUEST_ALIASES,
+                project_key, client=client)
+            if resolved is None:
+                return {"items": [], "stats": {}, "unavailable": True}
+            return _fetch_jira_by_type(resolved, project_key,
+                                       start_date, end_date, client=client)
+        except Exception as e:
+            logger.warning(f"fetch_service_requests exception: {e}")
+            return {"items": [], "stats": {}, "unavailable": True}
 
     def fetch_change_requests(self, project_key: str, start_date: str,
                               end_date: str, issue_type: str = "Change",
                               project_spec: dict | None = None) -> dict:
-        return globals()["fetch_change_requests"](
-            project_key, start_date, end_date,
-            issue_type=issue_type, project_spec=project_spec,
-        )
+        client = self._client_for(project_spec)
+        try:
+            resolved = _resolve_issue_type_for_project(
+                issue_type or "Change", _CHANGE_REQUEST_ALIASES,
+                project_key, client=client)
+            if resolved is None:
+                return {"items": [], "stats": {}, "unavailable": True}
+            return _fetch_jira_by_type(resolved, project_key,
+                                       start_date, end_date, client=client)
+        except Exception as e:
+            logger.warning(f"fetch_change_requests exception: {e}")
+            return {"items": [], "stats": {}, "unavailable": True}
 
     # -- 12-month trend -------------------------------------------------------
     def fetch_monthly_counts_12m(self, project_key: str, end_date: str,
                                  incident_issue_type: str = DEFAULT_INCIDENT_ISSUE_TYPE,
                                  project_spec: dict | None = None) -> dict:
-        return globals()["fetch_monthly_counts_12m"](
-            project_key, end_date,
-            incident_issue_type=incident_issue_type, project_spec=project_spec,
-        )
+        from dateutil.relativedelta import relativedelta
+
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            logger.warning("fetch_monthly_counts_12m: invalid end_date %s", end_date)
+            return {}
+
+        client = self._client_for(project_spec)
+        end_month = end_dt.replace(day=1)
+
+        monthly_counts: dict[str, int] = {}
+        for i in range(11, -1, -1):
+            m = end_month - relativedelta(months=i)
+            month_key = m.strftime("%Y-%m")
+            month_start = m.strftime("%Y-%m-%d")
+            month_end = (m + relativedelta(months=1)).strftime("%Y-%m-%d")
+            count = client.fetch_month_count(
+                project_key, month_start, month_end,
+                issue_type=incident_issue_type)
+            monthly_counts[month_key] = count
+            logger.info("fetch_monthly_counts_12m(%s): %s = %d",
+                        project_key, month_key, count)
+
+        return monthly_counts
 
     # -- multi-project orchestration -----------------------------------------
+    def _fetch_project_data(self, project_spec: dict, customer_record: dict,
+                            start_date: str, end_date: str,
+                            sections: list[str],
+                            csv_path: str | None = None,
+                            skip_monthly_trend: bool = False) -> dict:
+        """Fetch all Jira data for one project via a client bound to
+        ``project_spec`` (one client per project/thread in the fan-out)."""
+        proj_key = (project_spec.get("project_key") or "").strip()
+        proj_name = (project_spec.get("name") or proj_key or "Primary").strip()
+
+        incident_issue_type = (customer_record.get("jira_incident_issuetype") or "").strip() \
+            or DEFAULT_INCIDENT_ISSUE_TYPE
+        sr_issue_type = (customer_record.get("jira_service_request_issuetype") or "").strip() \
+            or "Service Request"
+        cr_issue_type = (customer_record.get("jira_change_request_issuetype") or "").strip() \
+            or "Change"
+
+        if csv_path:
+            result = self.fetch_incidents_from_csv(proj_key, start_date, end_date,
+                                                   csv_path=csv_path)
+        else:
+            result = self.fetch_incidents_for_report(
+                proj_key, start_date, end_date,
+                incident_issue_type=incident_issue_type, project_spec=project_spec)
+
+        out: dict = {
+            "incidents": result.get("incidents") or [],
+            "stats": result.get("stats") or {},
+            "project_name": proj_name,
+            "project_key": proj_key,
+        }
+        if result.get("error"):
+            out["error"] = result["error"]
+
+        if "service_requests" in sections and proj_key:
+            out["service_requests"] = self.fetch_service_requests(
+                proj_key, start_date, end_date,
+                issue_type=sr_issue_type, project_spec=project_spec,
+            )
+        if "change_requests" in sections and proj_key:
+            out["change_requests"] = self.fetch_change_requests(
+                proj_key, start_date, end_date,
+                issue_type=cr_issue_type, project_spec=project_spec,
+            )
+        if not csv_path and proj_key and not skip_monthly_trend:
+            out["monthly_trend_12m"] = self.fetch_monthly_counts_12m(
+                proj_key, end_date,
+                incident_issue_type=incident_issue_type,
+                project_spec=project_spec,
+            )
+
+        return out
+
     def fetch_all_projects(self, customer_record: dict, start_date: str,
                            end_date: str, sections: list[str],
                            csv_path: str | None = None,
                            project_filter: str | None = None) -> dict:
-        return globals()["fetch_all_projects"](
-            customer_record, start_date, end_date, sections,
-            csv_path=csv_path, project_filter=project_filter,
+        projects = customer_record.get("jira_projects") or []
+        if not projects:
+            # No Jira projects configured — return an empty shell so the caller
+            # can proceed with non-Jira sections. The downstream report flow
+            # already tolerates zero incidents.
+            return {"incidents": [], "stats": _compute_stats([])}
+
+        if project_filter:
+            projects = [p for p in projects if (p.get("name") or "") == project_filter]
+            if not projects:
+                logger.warning(
+                    "fetch_all_projects: project_filter=%r matched no project in customer record",
+                    project_filter,
+                )
+                return {"incidents": [], "stats": _compute_stats([])}
+
+        # Single-project shortcut keeps the legacy 1-project install path
+        # unchanged — no extra thread, no merge.
+        if len(projects) == 1:
+            return self._fetch_project_data(
+                projects[0], customer_record, start_date, end_date, sections,
+                csv_path=csv_path,
+            )
+
+        logger.info(
+            "fetch_all_projects: fanning out across %d Jira projects for customer=%s",
+            len(projects), customer_record.get("id", "?"),
         )
+        results: list[dict] = []
+        max_workers = min(4, len(projects))
+        # Each thread runs _fetch_project_data, which builds its own client per
+        # project via _client_for (no shared client across threads on the
+        # production path). _project_issue_types_cache stays module-level so the
+        # type-name cache is shared across those per-thread clients.
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(
+                    self._fetch_project_data, p, customer_record, start_date,
+                    end_date, sections, csv_path,
+                ): p
+                for p in projects
+            }
+            for fut in as_completed(futures):
+                proj = futures[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    logger.error(
+                        "fetch_all_projects: project=%s raised %s; skipping",
+                        proj.get("name", "?"), exc,
+                    )
+                    # Carry an empty per-project result so the merge accounting
+                    # is still correct (one entry per project, just empty).
+                    results.append({
+                        "incidents": [],
+                        "stats": _compute_stats([]),
+                        "project_name": proj.get("name", ""),
+                        "project_key": proj.get("project_key", ""),
+                        "error": str(exc),
+                    })
+
+        return self._merge_project_results(results)
 
     def _merge_project_results(self, results: list[dict]) -> dict:
-        return globals()["_merge_project_results"](results)
+        # Pure merge (no I/O) — delegates to the module-level helper.
+        return _merge_project_results(results)
 
 
-# Shared module-level pipeline instance backing the facade. Callers keep using
-# the module-level functions (unchanged); this instance exists so new code can
-# depend on the object interface, and so the pipeline's HTTP access is
-# expressible through a single shared client for the default (env-cred) path.
+# Shared module-level pipeline instance backing the facade. Constructed with NO
+# explicit client, so _client_for builds a fresh per-``project_spec`` client on
+# every call (production path). Callers keep using the module-level functions
+# (unchanged); this instance is what those facades delegate to.
 _PIPELINE = JiraReportPipeline()

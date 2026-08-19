@@ -10,16 +10,22 @@ against a stub client that returns canned Jira-shaped payloads — no network,
 no `httpx` monkeypatch. We drive the stub two ways:
 
   1. Directly against the pure functions, feeding normalized incident dicts.
-  2. Through the module-level facade functions, whose REST reach we redirect to
-     the stub by rebinding the module-level seam names (`jira_search`,
-     `_fetch_month_count`) — the same late-binding monkeypatch style the other
-     jira_client tests already rely on. This proves the pipeline talks to the
-     seam, not to httpx.
+  2. Through a stub client injected DIRECTLY into
+     `JiraReportPipeline(client=stub)` — no rebinding of any module-level name.
+     This is the anti-cosmetic guard: the first pass wired the stub in via a
+     `jc.jira_search` rebind, so the pipeline could ignore `self._client`
+     entirely and the test still passed. Here we inject the stub, assert the
+     stub's `.search` / `.fetch_month_count` are actually called, assert the
+     returned stats reflect the stub's canned data, AND trip `httpx.get` to
+     raise so any real HTTP attempt fails the test. Only a pipeline that reaches
+     REST exclusively through `self._client` can pass this.
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import httpx
 
 import tools.jira_client as jc
 from tools.jira_client import (
@@ -30,6 +36,29 @@ from tools.jira_client import (
 )
 
 fails = 0
+
+
+class _HttpTripwire:
+    """Context manager that replaces httpx.get with a raiser, so any real HTTP
+    attempt on the pipeline+stub path is a hard failure rather than a silent
+    network call. Proves the stub path never touches httpx."""
+
+    def __init__(self):
+        self.hit = False
+
+    def __enter__(self):
+        self._orig = httpx.get
+
+        def _boom(*a, **kw):
+            self.hit = True
+            raise AssertionError("httpx.get called — pipeline did NOT stay on the stub client")
+
+        httpx.get = _boom
+        return self
+
+    def __exit__(self, *exc):
+        httpx.get = self._orig
+        return False
 
 
 def check(name, cond):
@@ -133,11 +162,13 @@ check("LSG entity parsed", "LSG" in ent)
 check("unprefixed pending -> Unknown", "Unknown" in ent)
 
 
-# ── 2. fetch_incidents_for_report through the stub (no httpx) ─────────────────
-print("== fetch_incidents_for_report via stub client ==")
+# ── 2. fetch_incidents_for_report through an INJECTED stub (no httpx) ─────────
+print("== fetch_incidents_for_report via injected stub client (DI seam) ==")
 
-# The stub is wired in by redirecting the module-level seam (`jira_search`) to
-# it. Zero httpx involved — jira_client.jira_search is never reached.
+# The stub is injected straight into the pipeline — NO module-level rebind.
+# Under _HttpTripwire, any real httpx.get raises. This is the regression that
+# would have caught the first pass: a pipeline that ignored self._client and
+# fell through to the module-level jira_search would hit httpx here and fail.
 end_date = "2026-06-30"
 stub = StubJiraRestClient(search_pages={
     None: {
@@ -153,59 +184,66 @@ stub = StubJiraRestClient(search_pages={
     },
 })
 
-_orig_jira_search = jc.jira_search
-# Redirect the module-level primitive to the stub. The pipeline / facade calls
-# jira_search(...) by module-global name; this intercepts at the seam, not HTTP.
-jc.jira_search = lambda jql, max_results=100, next_page_token=None, project_spec=None: \
-    stub.search(jql, max_results=max_results, next_page_token=next_page_token)
-
-try:
-    pipeline = JiraReportPipeline(JiraRestClient())
+with _HttpTripwire() as tw:
+    pipeline = JiraReportPipeline(client=stub)
     result = pipeline.fetch_incidents_for_report("LSG", "2026-06-01", end_date)
     check("returns incidents + stats", set(result) >= {"incidents", "stats"})
     check("both incidents normalized", len(result["incidents"]) == 2)
-    check("stats.total via pipeline", result["stats"]["total"] == 2)
+    check("stats.total via pipeline reflects stub data", result["stats"]["total"] == 2)
     check("severity normalized in pipeline output",
           {i["severity"] for i in result["incidents"]} == {"High", "Low"})
     check("derived stats attached under stats.derived",
           "derived" in result["stats"] and "pending_aging" in result["stats"]["derived"])
     check("one pending (R-1 open), one closed excluded",
           result["stats"]["derived"]["pending_aging"]["total"] == 1)
-    check("stub actually queried (proves no httpx path)", len(stub.search_calls) >= 1)
-
-    # Same call via the bare module-level facade function must behave identically.
-    facade_result = jc.fetch_incidents_for_report("LSG", "2026-06-01", end_date)
-    check("facade fn matches pipeline method",
-          facade_result["stats"]["total"] == result["stats"]["total"])
-finally:
-    jc.jira_search = _orig_jira_search
+    # DI proof: the INJECTED stub was the one queried.
+    check("injected stub.search actually called", len(stub.search_calls) >= 1)
+    check("no real httpx.get attempted on stub path", tw.hit is False)
 
 
-# ── 3. fetch_monthly_counts_12m through the stub (no httpx) ───────────────────
-print("== fetch_monthly_counts_12m via stub client ==")
+# ── 3. fetch_monthly_counts_12m through an INJECTED stub (no httpx) ───────────
+print("== fetch_monthly_counts_12m via injected stub client (DI seam) ==")
 
 month_stub = StubJiraRestClient(month_counts={
     ("LSG", "2026-06-01"): 42,
     ("LSG", "2026-05-01"): 17,
 })
 
-_orig_month_count = jc._fetch_month_count
-# Redirect the module-level month-count primitive to the stub client. Again the
-# pipeline reaches this by module-global name — no httpx.get is exercised.
-jc._fetch_month_count = lambda project_key, month_start, month_end, \
-    issue_type=jc.DEFAULT_INCIDENT_ISSUE_TYPE, project_spec=None: \
-    month_stub.fetch_month_count(project_key, month_start, month_end, issue_type=issue_type)
-
-try:
-    pipeline = JiraReportPipeline(JiraRestClient())
+with _HttpTripwire() as tw:
+    pipeline = JiraReportPipeline(client=month_stub)
     counts = pipeline.fetch_monthly_counts_12m("LSG", "2026-06-30")
     check("12 month keys returned", len(counts) == 12)
-    check("June count from stub", counts.get("2026-06") == 42)
-    check("May count from stub", counts.get("2026-05") == 17)
+    check("June count from injected stub", counts.get("2026-06") == 42)
+    check("May count from injected stub", counts.get("2026-05") == 17)
     check("unstubbed month defaults to 0", counts.get("2026-01") == 0)
-    check("stub month_count actually called 12x", len(month_stub.month_calls) == 12)
+    # DI proof: the injected stub's fetch_month_count was called 12x, no httpx.
+    check("injected stub month_count called 12x", len(month_stub.month_calls) == 12)
+    check("no real httpx.get attempted on stub path", tw.hit is False)
+
+
+# ── 3b. facade still works via the module-level seam rebind ───────────────────
+# The production facade (fetch_incidents_for_report) has no injected client, so
+# _client_for builds a real JiraRestClient per call — which late-binds
+# jira_search. Rebinding the module-level jira_search must still intercept the
+# facade path (this is what keeps test_alert_pattern_analysis / ioc_history and
+# the 11 callers working). Proves the late-binding seam survives the rewrite.
+print("== facade path intercepts via module-level jira_search rebind ==")
+
+_facade_stub = StubJiraRestClient(search_pages={
+    None: {"issues": [
+        _raw_issue("F-1", "2026-06-15T10:00:00.000+0800", severity="High",
+                   status="Open", summary="LSG | LOGICALIS-9 | HIGH | f"),
+    ], "isLast": True},
+})
+_orig_jira_search = jc.jira_search
+jc.jira_search = lambda jql, max_results=100, next_page_token=None, project_spec=None: \
+    _facade_stub.search(jql, max_results=max_results, next_page_token=next_page_token)
+try:
+    facade_result = jc.fetch_incidents_for_report("LSG", "2026-06-01", "2026-06-30")
+    check("facade fetch total from rebound jira_search", facade_result["stats"]["total"] == 1)
+    check("facade path reached rebound seam", len(_facade_stub.search_calls) >= 1)
 finally:
-    jc._fetch_month_count = _orig_month_count
+    jc.jira_search = _orig_jira_search
 
 
 # ── 4. JiraRestClient is late-binding (monkeypatch-safe) ─────────────────────
