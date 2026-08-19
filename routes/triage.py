@@ -5,7 +5,7 @@ Design notes:
 - Deliberately BYPASSES the JIRA_ENRICHMENT_PROJECT allowlist: the analyst is
   Entra-authenticated and acting intentionally. A non-allowlisted project or a
   project with no customer record produces a warning, not a block.
-- Reuses routes.webhook._run_enrichment with manual=True: the pasted ticket is
+- Reuses tools.triage_orchestrator.run_enrichment with manual=True: the pasted ticket is
   NEVER dedup-closed, and the fetch does a SINGLE read with no entity-field
   polling — an existing ticket's fields either exist now or never will, so
   waiting only stalls the run (was the ~4-minute "stuck" bug on bare tickets).
@@ -23,7 +23,7 @@ import uuid
 from flask import Blueprint, jsonify, render_template, request, session
 
 from routes.auth import require_login
-from routes.webhook import _run_enrichment
+from tools.triage_orchestrator import run_enrichment
 from tools.customers import find_customer_by_jira_project
 from tools.jira_client import JIRA_URL, fetch_issue_by_key
 
@@ -137,7 +137,7 @@ def api_run_triage():
         "submitted_by": (session.get("user") or {}).get("email", ""),
     }
     thread = threading.Thread(
-        target=_run_enrichment,
+        target=run_enrichment,
         args=(job_id, ticket_key),
         kwargs={"jobs": _manual_jobs, "manual": True},
         daemon=True,
