@@ -32,7 +32,7 @@ from tools.historical_alerts import query_similar_alerts
 from tools.jira_client import fetch_issue_by_key
 from tools.rag_retrieval import retrieve_customer_context
 from tools.secrets import get_secret
-from tools.triage import TRIAGE_CONFIDENCE_THRESHOLD, triage_priority
+from tools.triage import TRIAGE_CONFIDENCE_THRESHOLD, decide_effective_priority, triage_priority
 
 logger = logging.getLogger(__name__)
 
@@ -406,25 +406,27 @@ def _run_triage_foundation(job_id: str, ticket_key: str, fields: dict,
     # ── 3. LLM Triage priority override ─────────────────────────────────
     rec = triage_priority(ticket_key, fields, severity, baseline_priority,
                           historical, rag_chunks_for_prompt, pattern_for_prompt)
-    if not rec:
+    decision = decide_effective_priority(rec, baseline_priority)
+
+    if decision["reason"] == "no_recommendation":
         logger.info("Triage %s: LLM rec unavailable for %s — keeping baseline",
                     job_id, ticket_key)
         return
 
-    if rec["confidence"] < TRIAGE_CONFIDENCE_THRESHOLD:
+    if decision["reason"] == "below_threshold":
         logger.info("Triage %s: override rejected for %s — confidence %.2f < %.2f",
                     job_id, ticket_key, rec["confidence"], TRIAGE_CONFIDENCE_THRESHOLD)
         return
 
-    if rec["recommended_priority"] == baseline_priority:
+    if decision["reason"] == "agrees_with_baseline":
         logger.info("Triage %s: LLM agrees with baseline (%s) for %s",
                     job_id, baseline_priority, ticket_key)
         return
 
-    if set_priority(ticket_key, rec["recommended_priority"]):
+    if set_priority(ticket_key, decision["effective_priority"]):
         logger.info("Triage %s: override accepted for %s — %s → %s (confidence %.2f). Rationale: %s",
                     job_id, ticket_key, baseline_priority or "(none)",
-                    rec["recommended_priority"], rec["confidence"], rec["rationale"][:200])
+                    decision["effective_priority"], rec["confidence"], rec["rationale"][:200])
 
 
 def _apply_dedup_if_strict_match(ticket_key: str, fields: dict) -> dict | None:
