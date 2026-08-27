@@ -77,10 +77,11 @@ Customer Knowledge Base context (when present) is high-quality customer-specific
 Customer Knowledge Base chunks below the prompt-relevance threshold are NOT shown here even if the analyst sees them in the comment — anything that does appear in this prompt has passed a stricter score cut, so weight it accordingly."""
 
 
-async def _call_llm(prompt: str) -> str:
+async def _call_llm(prompt: str, temperature: float | None = None) -> str:
+    import openai
     from tools.llm_client import make_chat_client
     client, model = make_chat_client()
-    response = await client.chat.completions.create(
+    kwargs = dict(
         model=model,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -89,6 +90,18 @@ async def _call_llm(prompt: str) -> str:
         max_completion_tokens=500,
         response_format={"type": "json_object"},
     )
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    try:
+        response = await client.chat.completions.create(**kwargs)
+    except openai.BadRequestError as e:
+        if temperature is not None and "temperature" in str(e).lower():
+            logger.warning("_call_llm: model rejected temperature=%s (%s); retrying without it",
+                           temperature, e)
+            kwargs.pop("temperature")
+            response = await client.chat.completions.create(**kwargs)
+        else:
+            raise
     return (response.choices[0].message.content or "").strip()
 
 
@@ -242,11 +255,30 @@ def _build_user_prompt(fields: dict, severity: str, baseline_priority: str,
     )
 
 
+def decide_effective_priority(rec: dict | None, baseline_priority: str | None) -> dict:
+    """Given a triage_priority() result and the severity-mapped baseline,
+    return the effective decision a ticket would actually receive.
+
+    Mirrors the accept/reject logic in
+    tools.triage_orchestrator._run_triage_foundation — kept here as the
+    single source of truth so the orchestrator and the eval harness can't
+    drift apart.
+    """
+    if not rec:
+        return {"effective_priority": baseline_priority, "accepted_override": False, "reason": "no_recommendation"}
+    if rec["confidence"] < TRIAGE_CONFIDENCE_THRESHOLD:
+        return {"effective_priority": baseline_priority, "accepted_override": False, "reason": "below_threshold"}
+    if rec["recommended_priority"] == baseline_priority:
+        return {"effective_priority": baseline_priority, "accepted_override": False, "reason": "agrees_with_baseline"}
+    return {"effective_priority": rec["recommended_priority"], "accepted_override": True, "reason": "override_accepted"}
+
+
 def triage_priority(ticket_key: str, fields: dict, severity: str,
                     baseline_priority: str | None,
                     historical: dict | None = None,
                     rag_chunks: list[dict] | None = None,
-                    pattern: dict | None = None) -> dict | None:
+                    pattern: dict | None = None,
+                    temperature: float | None = None) -> dict | None:
     """Synchronous wrapper around the async LLM call.
 
     Returns a dict like:
@@ -273,6 +305,11 @@ def triage_priority(ticket_key: str, fields: dict, severity: str,
     caller behind ALERT_PATTERN_TO_LLM_PROMPT_ENABLED. When present, the
     prompt includes 30-day frequency / timing / outcome stats and per-entity
     prior-incident correlation as escalation/de-escalation evidence.
+
+    `temperature` is None by default (omitted from the API call, unchanged
+    production behavior). Pass a value to reduce sampling variance — used by
+    the offline eval harness (tools/eval_triage_run.py). If the configured
+    model rejects it, `_call_llm` retries once without it.
     """
     try:
         from tools.enrichment import extract_iocs_from_entity_fields
@@ -300,7 +337,7 @@ def triage_priority(ticket_key: str, fields: dict, severity: str,
     try:
         # asyncio.run is safe here because the webhook background thread has no
         # running event loop. Each call gets its own short-lived loop.
-        raw = asyncio.run(_call_llm(user_prompt))
+        raw = asyncio.run(_call_llm(user_prompt, temperature=temperature))
     except Exception as e:
         logger.warning("triage_priority(%s): LLM call failed (%s: %s); keeping baseline",
                        ticket_key, type(e).__name__, e)
