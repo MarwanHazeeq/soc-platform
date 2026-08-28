@@ -82,6 +82,69 @@ check("web failure isolated -> context still built", "SNAPSHOT" in ctx)
 check("system prompt cites web rules", "WEB SEARCH RESULTS" in dashboard_chat._SYSTEM_PROMPT
       and "cite the source domain" in dashboard_chat._SYSTEM_PROMPT)
 
+print("customer-knowledge (RAG) grounding:")
+import tools.rag_retrieval as rag_retrieval
+tavily_client.fetch_web_context = lambda q: ""   # keep the web block out of the way
+os.environ["RAG_PROMPT_MIN_SCORE"] = "0.7"
+
+calls = []
+def _stub(status, chunks):
+    def _fn(query, customer_id=None):
+        calls.append((query, customer_id))
+        return {"status": status, "chunks": chunks}
+    return _fn
+
+_MATCH = [{"text": "Escalate  critical\nphishing to the customer SOC lead.",
+           "source": "Escalation Matrix", "score": 0.91}]
+
+# Default (flag unset) — code ships dark.
+os.environ.pop("DASHBOARD_CHAT_RAG_ENABLED", None)
+rag_retrieval.retrieve_customer_context = _stub("matched", _MATCH)
+ctx = dashboard_chat.build_context("what is our escalation path?", "c1")
+check("flag off -> no knowledge block", "CUSTOMER KNOWLEDGE BASE" not in ctx)
+check("flag off -> retrieval not called", calls == [])
+
+os.environ["DASHBOARD_CHAT_RAG_ENABLED"] = "true"
+
+# "All customers" view: no customer to scope the per-customer store to.
+ctx = dashboard_chat.build_context("what is our escalation path?", None)
+check("no customer -> no knowledge block", "CUSTOMER KNOWLEDGE BASE" not in ctx)
+check("no customer -> retrieval not called", calls == [])
+
+ctx = dashboard_chat.build_context("what is our escalation path?", "c1")
+check("matched -> block present with source tag",
+      "CUSTOMER KNOWLEDGE BASE (Confluence):" in ctx
+      and "[Escalation Matrix]" in ctx
+      and "Escalate critical phishing" in ctx)   # whitespace collapsed
+check("query + customer forwarded to retrieval",
+      calls == [("what is our escalation path?", "c1")])
+check("knowledge block ordered before web results",
+      "CUSTOMER KNOWLEDGE BASE" in ctx and "SNAPSHOT" in ctx
+      and ctx.index("SNAPSHOT") < ctx.index("CUSTOMER KNOWLEDGE BASE"))
+
+rag_retrieval.retrieve_customer_context = _stub("no_matches", [])
+check("no_matches -> no block",
+      "CUSTOMER KNOWLEDGE BASE" not in dashboard_chat.build_context("q about policy", "c1"))
+
+rag_retrieval.retrieve_customer_context = _stub(
+    "matched", [{"text": "weak hit", "source": "Runbook", "score": 0.55}])
+ctx = dashboard_chat.build_context("q about policy", "c1")
+check("below RAG_PROMPT_MIN_SCORE -> chunk filtered out, no block",
+      "weak hit" not in ctx and "CUSTOMER KNOWLEDGE BASE" not in ctx)
+
+def _rag_boom(query, customer_id=None):
+    raise RuntimeError("chroma down")
+rag_retrieval.retrieve_customer_context = _rag_boom
+ctx = dashboard_chat.build_context("q about policy", "c1")
+check("retrieval failure isolated -> context still built",
+      "SNAPSHOT" in ctx and "CUSTOMER KNOWLEDGE BASE" not in ctx)
+
+check("system prompt states the knowledge-base rule",
+      "CUSTOMER KNOWLEDGE BASE (Confluence)" in dashboard_chat._SYSTEM_PROMPT
+      and "name the source page" in dashboard_chat._SYSTEM_PROMPT)
+
+os.environ.pop("DASHBOARD_CHAT_RAG_ENABLED", None)
+
 print("failure isolation:")
 async def boom(messages):
     raise RuntimeError("llm down")
