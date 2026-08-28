@@ -17,9 +17,16 @@ context the server injects up front:
      copilot can reach out for external knowledge: CVEs, threat actors,
      tools, IP/domain reputation context. Killswitch
      DASHBOARD_CHAT_WEB_ENABLED (default on); fail-silent.
+  5. Customer-scoped Confluence knowledge (the same Phase 4 RAG store the
+     automated L1 triage comment draws on — runbooks, escalation matrices,
+     whitelists, asset inventories) so the copilot can answer "what does
+     OUR procedure say" rather than only "what happened". Requires a
+     customer to be selected; the "All customers" view skips it.
+     Killswitch DASHBOARD_CHAT_RAG_ENABLED (default off); fail-silent.
 The model is instructed to treat the alert data as the ONLY source of truth
-about tickets, use web results only for external knowledge (citing source
-domains), and say so when neither contains the answer.
+about tickets, treat the knowledge base as customer policy, use web results
+only for external knowledge (citing source domains), and say so when none of
+them contains the answer.
 
 Failure isolation: answer() never raises — it returns an apologetic string
 on any error, and the L1 pipeline is never touched.
@@ -38,21 +45,28 @@ _MAX_HISTORY = 8            # prior turns forwarded to the model
 _MAX_TICKET_FETCHES = 2     # live Jira lookups per question
 _SNAPSHOT_ROWS = 50         # read-model rows in the context
 _MAX_COMMENT_CHARS = 1800   # cap per fetched enrichment comment
+_MAX_RAG_CHUNK_CHARS = 700  # cap per retrieved Confluence chunk
 
 _TICKET_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}-\d{1,6}\b")
 
 _SYSTEM_PROMPT = (
     "You are the SOC dashboard copilot for Logicalis SOC analysts. The user "
     "message contains a DATA section (recent-alert snapshot, metrics, fetched "
-    "ticket details) and may contain a WEB SEARCH RESULTS section. Rules: "
+    "ticket details) and may contain a CUSTOMER KNOWLEDGE BASE (Confluence) "
+    "section and a WEB SEARCH RESULTS section. Rules: "
     "(1) The DATA section is the ONLY source of truth about the customer's "
     "tickets, verdicts, IOCs, and timestamps — never invent or infer ticket "
     "facts beyond it. "
-    "(2) Use WEB SEARCH RESULTS for external knowledge — CVEs, threat actors, "
+    "(2) The CUSTOMER KNOWLEDGE BASE (Confluence) section, when present, is "
+    "the customer's own documented procedure — runbooks, escalation matrices, "
+    "whitelists, asset inventories. Prefer it over general knowledge for "
+    "'what should we do' questions, and name the source page in parentheses "
+    "for any claim drawn from it. It describes policy, not live ticket facts. "
+    "(3) Use WEB SEARCH RESULTS for external knowledge — CVEs, threat actors, "
     "malware, tools, IP/domain reputation, event-ID meanings — and cite the "
     "source domain in parentheses for any web-derived claim. "
-    "(3) If neither contains the answer, say so plainly and suggest what the "
-    "analyst could check. "
+    "(4) If none of them contains the answer, say so plainly and suggest what "
+    "the analyst could check. "
     "Always reference tickets by their key (e.g. SCDM-727). Be concise: a "
     "few sentences, or a short list when comparing several items. Plain "
     "text only — no markdown formatting."
@@ -149,6 +163,45 @@ def _web_context(message: str) -> str:
         return ""
 
 
+def _rag_context(message: str, customer_id: str | None) -> str:
+    """Customer-scoped Confluence knowledge for the copilot prompt.
+
+    Reuses the triage-side retrieval primitive (tools.rag_retrieval) unchanged
+    — that function already enforces RAG_LOOKUP_ENABLED, the hard timeout,
+    RAG_TOP_K/RAG_MIN_SCORE, and never raises. Fail-silent: '' when disabled,
+    when no customer is selected (the "All customers" view), when nothing
+    scores above threshold, or on any error."""
+    if os.environ.get("DASHBOARD_CHAT_RAG_ENABLED", "false").strip().lower() != "true":
+        return ""
+    if not (customer_id or "").strip():
+        # Per-customer store: an unscoped question has no store to search.
+        return ""
+    try:
+        from tools.rag_retrieval import retrieve_customer_context
+        result = retrieve_customer_context((message or "").strip(),
+                                           customer_id=customer_id)
+        if (result or {}).get("status") != "matched":
+            return ""
+        # Stricter cut-off than the analyst-facing comment threshold, same
+        # rationale as RAG_PROMPT_MIN_SCORE on the triage path: noise that's
+        # safe to show an analyst isn't safe to feed the model's reasoning.
+        try:
+            floor = float(os.environ.get("RAG_PROMPT_MIN_SCORE", "0.7"))
+        except (TypeError, ValueError):
+            floor = 0.7
+        lines: list[str] = []
+        for c in (result.get("chunks") or []):
+            text = " ".join((c.get("text") or "").split())
+            if not text or float(c.get("score") or 0.0) < floor:
+                continue
+            lines.append(f"- [{c.get('source') or 'doc'}] "
+                         f"{text[:_MAX_RAG_CHUNK_CHARS]}")
+        return "\n".join(lines)
+    except Exception:
+        logger.exception("dashboard_chat: RAG retrieval failed")
+        return ""
+
+
 def build_context(message: str, customer_id: str | None) -> str:
     blocks = [_snapshot_block(customer_id)]
     for key in _mentioned_ticket_keys(message):
@@ -158,6 +211,11 @@ def build_context(message: str, customer_id: str | None) -> str:
             logger.exception("dashboard_chat: ticket fetch failed for %s", key)
             detail = ""
         blocks.append(detail or f"Ticket {key}: could not be fetched from Jira.")
+    # Internal customer knowledge before external web results — mirrors the
+    # trust hierarchy the system prompt states.
+    rag = _rag_context(message, customer_id)
+    if rag:
+        blocks.append("CUSTOMER KNOWLEDGE BASE (Confluence):\n" + rag)
     web = _web_context(message)
     if web:
         blocks.append("WEB SEARCH RESULTS:\n" + web)
